@@ -18,7 +18,7 @@
 const obsidian = require('obsidian');
 const { Plugin, PluginSettingTab, Setting, TextFileView, Notice, Modal, requestUrl } = obsidian;
 
-const BUILD_VERSION = '0.1.0';
+const BUILD_VERSION = '0.1.1';
 const PLUGIN_ID = '2alm';
 const VIEW_TYPE = '2alm-notebook-view';
 const FILE_EXT = '2alm';
@@ -30,8 +30,9 @@ const MIN_SCALE = 0.2;
 const MAX_SCALE = 8;
 const MAX_HISTORY = 300;
 const PAPER = '#fbfaf6';
-const PREDICT = 0.5;          // fraction of the last step used to extend the live stroke for display
-const SIMPLIFY_EPS = 0.12;    // page units; points closer than this to the line are dropped on save
+const PREDICT = 0.6;          // fraction of the last step used to extend the live stroke for display
+const RESAMPLE_STEP = 1.5;    // page units between drawn samples; the live and saved shapes come from the same curve
+const SIMPLIFY_EPS = 0.08;    // page units; points closer than this to the line are dropped on save
 const TEMPLATES = ['blank', 'lined', 'grid', 'dot'];
 const PALETTE = ['#1d1d1f', '#0a84ff', '#ff3b30', '#34c759', '#ffd60a'];
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
@@ -53,6 +54,12 @@ const round = (v, d) => {
 };
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
+const DEBUG = { entries: [], max: 200 };
+function logEvent(kind, msg) {
+  DEBUG.entries.push(new Date().toISOString().slice(11, 19) + ' ' + kind + ' ' + msg);
+  if (DEBUG.entries.length > DEBUG.max) DEBUG.entries.shift();
+}
+
 let idCounter = 0;
 function newId() {
   idCounter = (idCounter + 1) % 1e9;
@@ -64,7 +71,7 @@ function newId() {
  * Input is in page units; time is in seconds.
  */
 class OneEuroFilter {
-  constructor(minCutoff = 1.2, beta = 0.01, dCutoff = 1.0) {
+  constructor(minCutoff = 1.6, beta = 0.02, dCutoff = 1.0) {
     this.minCutoff = minCutoff;
     this.beta = beta;
     this.dCutoff = dCutoff;
@@ -227,6 +234,40 @@ function simplifyPts(pts, eps) {
     }
   }
   return pts.filter((_, i) => keep[i] === 1);
+}
+
+/**
+ * Passes a smooth Catmull-Rom curve through the samples and emits points about `spacing` apart.
+ * Used both while drawing and when saving, so the stroke you see is the stroke that is kept.
+ */
+function resampleSmooth(input, spacing) {
+  const pts = [];
+  for (const q of input) {
+    const last = pts[pts.length - 1];
+    if (!last || Math.hypot(q.x - last.x, q.y - last.y) > 1e-6) pts.push(q);
+  }
+  const n = pts.length;
+  if (n < 2) return pts.slice();
+  const out = [pts[0]];
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = pts[i > 0 ? i - 1 : 0];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[i + 2 < n ? i + 2 : n - 1];
+    const len = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    const k = Math.max(1, Math.ceil(len / spacing));
+    for (let s = 1; s <= k; s++) {
+      const t = s / k;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      const x = 0.5 * (2 * p1.x + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+      const y = 0.5 * (2 * p1.y + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+      out.push({ x, y, p: p1.p + (p2.p - p1.p) * t, t: p1.t + (p2.t - p1.t) * t });
+    }
+  }
+  const end = pts[n - 1];
+  out[out.length - 1] = { x: end.x, y: end.y, p: end.p, t: end.t };
+  return out;
 }
 
 function polyToPath(poly) {
@@ -632,6 +673,15 @@ function drawTemplate(ctx, template, view) {
   ctx.restore();
 }
 
+/**
+ * Obsidian may hand us file contents after we saved. We only accept them when they are not our
+ * own last save and we have no unsaved edits, so in-progress strokes are never overwritten.
+ */
+function acceptExternalData(lastSaved, incoming, dirty) {
+  if (dirty) return false;
+  return incoming !== lastSaved;
+}
+
 class NotebookView extends TextFileView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -656,6 +706,8 @@ class NotebookView extends TextFileView {
     this.cssH = 0;
     this.dpr = 1;
     this.ro = null;
+    this.lastSaved = null;
+    this.dirty = false;
   }
 
   getViewType() {
@@ -671,13 +723,27 @@ class NotebookView extends TextFileView {
     return ext === FILE_EXT;
   }
 
+  requestSave() {
+    this.dirty = true;
+    super.requestSave();
+  }
+
   getViewData() {
     if (this.loadError) return this.rawData; // never overwrite a file we could not read
-    if (!this.pages.length) return newNotebookText();
-    return serializeNotebook(this.pages.map((p) => ({ template: p.template, strokes: p.hist.present })));
+    const text = this.pages.length
+      ? serializeNotebook(this.pages.map((p) => ({ template: p.template, strokes: p.hist.present })))
+      : newNotebookText();
+    this.lastSaved = text;
+    this.dirty = false;
+    return text;
   }
 
   setViewData(data, clear) {
+    if (this.pages.length && !acceptExternalData(this.lastSaved, data, this.dirty)) {
+      this.ensureDom();
+      this.refreshChrome();
+      return;
+    }
     this.rawData = data;
     this.loadError = null;
     this.live = null;
@@ -733,11 +799,31 @@ class NotebookView extends TextFileView {
 
     this.buildToolbar();
     this.buildPageBar();
+    root.querySelectorAll('.twoalm-btn[title]').forEach((b) => {
+      if (b.querySelector('.twoalm-btn-label')) return;
+      const s = document.createElement('span');
+      s.className = 'twoalm-btn-label';
+      s.textContent = b.getAttribute('title').split(' (')[0];
+      b.appendChild(s);
+    });
 
-    this.canvas.addEventListener('pointerdown', (e) => this.onPointerDown(e));
-    this.canvas.addEventListener('pointermove', (e) => this.onPointerMove(e));
-    this.canvas.addEventListener('pointerup', (e) => this.onPointerUp(e));
-    this.canvas.addEventListener('pointercancel', (e) => this.onPointerUp(e));
+    const safe = (name, fn) => (e) => {
+      try {
+        fn(e);
+      } catch (err) {
+        logEvent('error', name + ': ' + (err && err.message ? err.message : err));
+        this.live = null;
+        this.erasing = null;
+        this.touches.clear();
+        this.pinch = null;
+        this.schedule();
+      }
+    };
+    this.canvas.addEventListener('pointerdown', safe('down', (e) => this.onPointerDown(e)));
+    this.canvas.addEventListener('pointermove', safe('move', (e) => this.onPointerMove(e)));
+    this.canvas.addEventListener('pointerup', safe('up', (e) => this.onPointerUp(e)));
+    this.canvas.addEventListener('pointercancel', safe('cancel', (e) => this.onPointerUp(e)));
+    this.canvas.addEventListener('lostpointercapture', safe('lost', (e) => this.onPointerUp(e)));
     this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     this.canvas.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
     root.addEventListener('keydown', (e) => this.onKey(e));
@@ -817,8 +903,8 @@ class NotebookView extends TextFileView {
     this.btnPrev = button(ICONS.prev, 'Previous page', () => this.goPage(this.pageIndex - 1));
     this.pageLabel = pb.createDiv({ cls: 'twoalm-label' });
     this.btnNext = button(ICONS.next, 'Next page', () => this.goPage(this.pageIndex + 1));
-    button(ICONS.add, 'New blank page', () => this.addPage());
-    button(ICONS.template, 'Cycle page template', () => this.cycleTemplate());
+    button(ICONS.add, 'New page', () => this.addPage());
+    button(ICONS.template, 'Template (cycle)', () => this.cycleTemplate());
   }
 
   refreshChrome() {
@@ -979,6 +1065,7 @@ class NotebookView extends TextFileView {
   }
 
   beginStroke(e) {
+    if (this.live) this.finishStroke(); // never drop an unfinished stroke
     const page = this.currentPage();
     if (!page) return;
     const pt = this.toPage(e);
@@ -1017,7 +1104,7 @@ class NotebookView extends TextFileView {
     this.live = null;
     const page = this.currentPage();
     if (!live || !page || live.pts.length === 0) return;
-    const pts = simplifyPts(live.pts, SIMPLIFY_EPS);
+    const pts = simplifyPts(resampleSmooth(live.pts, RESAMPLE_STEP), SIMPLIFY_EPS);
     const stroke = makeStroke(live.tool, live.color, live.size, pts);
     page.hist.commit(page.hist.present, [...page.hist.present, stroke]);
     this.commitChange();
@@ -1089,7 +1176,10 @@ class NotebookView extends TextFileView {
     if (this.raf || !this.canvas) return;
     this.raf = requestAnimationFrame(() => {
       this.raf = 0;
+      const t0 = now();
       this.paint();
+      const ms = now() - t0;
+      if (ms > 40) logEvent('slow', `frame ${ms.toFixed(0)} ms, strokes ${this.currentPage() ? this.currentPage().hist.present.length : 0}`);
     });
   }
 
@@ -1141,7 +1231,7 @@ class NotebookView extends TextFileView {
 
   paintLive(ctx, view) {
     const L = this.live;
-    const pts = L.pts.slice();
+    const pts = resampleSmooth(L.pts, RESAMPLE_STEP);
     if (pts.length >= 2) {
       // Show the pen slightly ahead of the last smoothed sample. Display only; never stored.
       const a = pts[pts.length - 2];
@@ -1563,6 +1653,80 @@ const SELF_TESTS = [
     },
   },
 
+  // --- v0.1.1: curve fidelity, data safety, diagnostics
+  {
+    name: 'Curve: the drawn curve passes through every sample and keeps its endpoints',
+    run() {
+      const input = [];
+      for (let i = 0; i < 12; i++) input.push({ x: i * 7, y: Math.sin(i) * 20, p: 0.5, t: i * 10 });
+      const out = resampleSmooth(input, 1.5);
+      for (const q of input) {
+        const hit = out.some((o) => Math.hypot(o.x - q.x, o.y - q.y) < 1e-9);
+        assert(hit, `sample (${q.x}, ${q.y}) is not on the curve`);
+      }
+      assert(out[0].x === input[0].x && out[out.length - 1].x === input[11].x, 'endpoints moved');
+    },
+  },
+  {
+    name: 'Curve: resampled steps are never much longer than the spacing',
+    run() {
+      const input = [{ x: 0, y: 0, p: 1, t: 0 }, { x: 200, y: 40, p: 1, t: 1 }, { x: 260, y: 10, p: 1, t: 2 }];
+      const out = resampleSmooth(input, 1.5);
+      for (let i = 1; i < out.length; i++) {
+        const d = Math.hypot(out[i].x - out[i - 1].x, out[i].y - out[i - 1].y);
+        // Spacing is uniform in curve parameter, so sharp turns can stretch a step to about 2x.
+        // That changes point density only, never the shape, so the limit is 2.5x.
+        assert(d <= 1.5 * 2.5, `step ${d.toFixed(3)} is too long`);
+      }
+    },
+  },
+  {
+    name: 'Curve: a straight stroke stays straight after resampling',
+    run() {
+      const input = [];
+      for (let i = 0; i < 6; i++) input.push({ x: i * 10, y: 5, p: 0.5, t: i });
+      for (const q of resampleSmooth(input, 1.5)) assertClose(q.y, 5, 1e-9, 'bent');
+    },
+  },
+  {
+    name: 'Curve: duplicate samples (a pen that pauses) do not create NaN or zero-length steps',
+    run() {
+      const input = [{ x: 1, y: 1, p: 0.5, t: 0 }, { x: 1, y: 1, p: 0.5, t: 1 }, { x: 9, y: 1, p: 0.5, t: 2 }, { x: 9, y: 1, p: 0.5, t: 3 }];
+      const out = resampleSmooth(input, 1.5);
+      for (const q of out) assert(Number.isFinite(q.x) && Number.isFinite(q.y), 'non-finite');
+      assert(out.length >= 2, 'lost the stroke');
+    },
+  },
+  {
+    name: 'Data safety: external contents are ignored while there are unsaved edits',
+    run() {
+      assert(acceptExternalData('saved-a', 'other', true) === false, 'overwrote unsaved work');
+    },
+  },
+  {
+    name: 'Data safety: our own last save is not reloaded over the live state',
+    run() {
+      assert(acceptExternalData('saved-a', 'saved-a', false) === false, 'reloaded our own save');
+    },
+  },
+  {
+    name: 'Data safety: genuinely new external contents are accepted when clean',
+    run() {
+      assert(acceptExternalData('saved-a', 'edited-elsewhere', false) === true, 'refused a real change');
+      assert(acceptExternalData(null, 'first load', false) === true, 'refused the first load');
+    },
+  },
+  {
+    name: 'Diagnostics: the event log keeps only the newest 200 entries',
+    run() {
+      const before = DEBUG.entries.length;
+      for (let i = 0; i < 250; i++) logEvent('test', 'entry ' + i);
+      assert(DEBUG.entries.length === DEBUG.max, `length ${DEBUG.entries.length}`);
+      assert(DEBUG.entries[DEBUG.entries.length - 1].endsWith('entry 249'), 'newest entry missing');
+      DEBUG.entries.length = Math.min(before, DEBUG.max);
+    },
+  },
+
   // --- performance budgets (generous; reported in the results list)
   {
     name: 'Budget: outlining 5000 points takes under 250 ms',
@@ -1647,11 +1811,29 @@ class SelfTestModal extends Modal {
 // 8. Plugin class and settings
 // ============================================================================
 
+class DebugLogModal extends Modal {
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h2', { text: '2alm debug log' });
+    const box = contentEl.createEl('textarea', { attr: { readonly: 'true', rows: '16' } });
+    box.style.width = '100%';
+    box.style.fontFamily = 'var(--font-monospace)';
+    box.value = DEBUG.entries.length ? DEBUG.entries.join('\n') : '(no events recorded this session)';
+    contentEl.createEl('button', { text: 'Select all' }).addEventListener('click', () => box.select());
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class TwoAlmPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
     this.registerView(VIEW_TYPE, (leaf) => new NotebookView(leaf, this));
     this.registerExtensions([FILE_EXT], VIEW_TYPE);
+    this.registerDomEvent(window, 'error', (e) => logEvent('error', `${e.message} (line ${e.lineno})`));
+    this.registerDomEvent(window, 'unhandledrejection', (e) => logEvent('error', 'promise: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)));
 
     this.addRibbonIcon('pen-tool', '2alm: new notebook', () => this.createNotebook());
     this.addCommand({ id: 'new-notebook', name: 'New notebook', callback: () => this.createNotebook() });
@@ -1660,6 +1842,7 @@ class TwoAlmPlugin extends Plugin {
       name: 'Check for 2alm updates and install',
       callback: () => this.checkForUpdates({ install: true }),
     });
+    this.addCommand({ id: 'show-debug-log', name: 'Show 2alm debug log', callback: () => new DebugLogModal(this.app).open() });
     this.addCommand({ id: 'run-self-tests', name: 'Run 2alm engine self-tests', callback: () => this.showSelfTests() });
     this.addSettingTab(new TwoAlmSettingTab(this.app, this));
     console.log(`2alm ${BUILD_VERSION} loaded`);
@@ -1813,4 +1996,8 @@ TwoAlmPlugin.__internals = {
   downloadRelease,
   writeRelease,
   makeStroke,
+  resampleSmooth,
+  acceptExternalData,
+  logEvent,
+  DEBUG,
 };
