@@ -1,7 +1,7 @@
 {
   "id": "2alm",
   "name": "2alm",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "minAppVersion": "1.5.0",
   "description": "Stylus-first handwriting notebooks. Alpha 0: writing engine prototype.",
   "author": "Personal",
