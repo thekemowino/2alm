@@ -18,7 +18,7 @@
 const obsidian = require('obsidian');
 const { Plugin, PluginSettingTab, Setting, TextFileView, Notice, Modal, requestUrl } = obsidian;
 
-const BUILD_VERSION = '0.2.0';
+const BUILD_VERSION = '0.2.1';
 const PLUGIN_ID = '2alm';
 const VIEW_TYPE = '2alm-notebook-view';
 const FILE_EXT = '2alm';
@@ -31,12 +31,13 @@ const MAX_SCALE = 8;
 const MAX_HISTORY = 300;
 const PAPER = '#fbfaf6';
 const INK = '#1d1d1f';
-const STROKE_BASE = 2.2; // page units; the pen's thickness before pressure
+const STROKE_BASE = 2.4; // page units; the pen's thickness
 const PEN_CODE = 1;
 
 const DEFAULT_SETTINGS = {
   updateBaseUrl: '',
   palmRejectMs: 900,
+  pressureWidth: false, // off: every stroke is one even line. On: pressure changes thickness.
 };
 
 // ============================================================================
@@ -145,6 +146,22 @@ function strokePolys(stroke) {
     }
   }
   return out;
+}
+
+/** The raw samples of a stroke as a line. A single sample becomes a dot. */
+function linePoints(stroke) {
+  const pts = stroke.pts;
+  if (pts.length === 1) return [pts[0], { x: pts[0].x + 0.001, y: pts[0].y, p: pts[0].p, t: pts[0].t }];
+  return pts;
+}
+
+function linePath(stroke) {
+  const pts = linePoints(stroke);
+  const p = new Path2D();
+  if (pts.length === 0) return p;
+  p.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) p.lineTo(pts[i].x, pts[i].y);
+  return p;
 }
 
 function polysToPath(polys) {
@@ -444,16 +461,21 @@ class NotebookView extends TextFileView {
     this.vp = new Viewport();
     this.viewReady = false;
     this.router = new InputRouter(plugin.settings.palmRejectMs);
-    this.live = null;         // the stroke being written right now
+    this.liveStroke = null;   // the stroke being written right now
+    this.penId = null;        // pointer currently holding the pen (or mouse) on the glass
+    this.penLast = null;      // last sample of that pointer, so an interrupted stroke can continue
     this.touches = new Map(); // finger pointerId -> last screen position
-    this.pathCache = new WeakMap();
-    this.raf = 0;
+    this.lineCache = new WeakMap();
+    this.polyCache = new WeakMap();
+    this.baseRaf = 0;
+    this.liveRaf = 0;
     this.cssW = 0;
     this.cssH = 0;
     this.dpr = 1;
     this.ro = null;
     this.lastSaved = null;
     this.dirty = false;
+    this.counts = { cancels: 0, lostCaptures: 0, resumes: 0 };
   }
 
   getViewType() {
@@ -490,7 +512,8 @@ class NotebookView extends TextFileView {
     }
     this.rawData = data;
     this.loadError = null;
-    this.live = null;
+    this.liveStroke = null;
+    this.endPen();
     this.touches.clear();
     try {
       const nb = parseNotebook(data);
@@ -505,13 +528,15 @@ class NotebookView extends TextFileView {
     this.ensureDom();
     if (!this.viewReady) this.resetView();
     this.refresh();
-    this.schedule();
+    this.scheduleBase();
+    this.scheduleLive();
   }
 
   clear() {
     this.hist = new History([]);
-    this.live = null;
-    this.schedule();
+    this.liveStroke = null;
+    this.scheduleBase();
+    this.scheduleLive();
   }
 
   async onOpen() {
@@ -519,8 +544,10 @@ class NotebookView extends TextFileView {
   }
 
   async onClose() {
-    if (this.raf) cancelAnimationFrame(this.raf);
-    this.raf = 0;
+    if (this.baseRaf) cancelAnimationFrame(this.baseRaf);
+    if (this.liveRaf) cancelAnimationFrame(this.liveRaf);
+    this.baseRaf = 0;
+    this.liveRaf = 0;
     if (this.ro) this.ro.disconnect();
     this.ro = null;
   }
@@ -528,7 +555,7 @@ class NotebookView extends TextFileView {
   // ---- DOM ----
 
   ensureDom() {
-    if (this.canvas) return;
+    if (this.overlay) return;
     const root = this.contentEl;
     root.empty();
     root.addClass('twoalm-root');
@@ -546,34 +573,38 @@ class NotebookView extends TextFileView {
     this.btnClear = button('Clear page', 'Clear this page (you can undo it)', () => this.clearPage());
     button('Reset zoom', 'Return to the default view', () => {
       this.resetView();
-      this.schedule();
+      this.scheduleBase();
+      this.scheduleLive();
     });
     this.status = toolbar.createDiv({ cls: 'twoalm-status' });
 
     this.stage = root.createDiv({ cls: 'twoalm-stage' });
-    this.canvas = this.stage.createEl('canvas', { cls: 'twoalm-canvas' });
-    this.ctx = this.canvas.getContext('2d');
+    // Committed ink lives on the base layer. The stroke being written lives on the overlay,
+    // which is the only element that receives pointer input.
+    this.base = this.stage.createEl('canvas', { cls: 'twoalm-canvas twoalm-base' });
+    this.overlay = this.stage.createEl('canvas', { cls: 'twoalm-canvas twoalm-overlay' });
+    this.baseCtx = this.base.getContext('2d');
+    this.overlayCtx = this.overlay.getContext('2d');
 
     const safe = (name, fn) => (e) => {
       const t0 = now();
       try {
         fn(e);
       } catch (err) {
+        // An error must never end a stroke. Log it and keep going.
         logEvent('error', name + ': ' + (err && err.message ? err.message : err));
-        this.live = null;
-        this.touches.clear();
-        this.schedule();
       }
       const ms = now() - t0;
       if (ms > 25) logEvent('slow', `${name} took ${ms.toFixed(0)} ms`);
     };
-    this.canvas.addEventListener('pointerdown', safe('down', (e) => this.onPointerDown(e)));
-    this.canvas.addEventListener('pointermove', safe('move', (e) => this.onPointerMove(e)));
-    this.canvas.addEventListener('pointerup', safe('up', (e) => this.onPointerUp(e)));
-    this.canvas.addEventListener('pointercancel', safe('cancel', (e) => this.onPointerUp(e)));
-    this.canvas.addEventListener('lostpointercapture', safe('lost', (e) => this.onPointerUp(e)));
-    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-    this.canvas.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
+    const o = this.overlay;
+    o.addEventListener('pointerdown', safe('down', (e) => this.onPointerDown(e)));
+    o.addEventListener('pointermove', safe('move', (e) => this.onPointerMove(e)));
+    o.addEventListener('pointerup', safe('up', (e) => this.onPointerUp(e)));
+    o.addEventListener('pointercancel', safe('cancel', (e) => this.onPointerCancel(e)));
+    o.addEventListener('lostpointercapture', safe('lostcapture', (e) => this.onLostCapture(e)));
+    o.addEventListener('contextmenu', (e) => e.preventDefault());
+    o.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
 
     if (typeof ResizeObserver !== 'undefined') {
       this.ro = new ResizeObserver(() => this.resize());
@@ -587,21 +618,26 @@ class NotebookView extends TextFileView {
     if (!this.btnUndo) return;
     this.btnUndo.disabled = !this.hist.canUndo;
     const n = this.hist.present.length;
-    this.status.setText(this.loadError ? 'read error' : `${n} stroke${n === 1 ? '' : 's'}`);
+    let text = this.loadError ? 'read error' : `${n} stroke${n === 1 ? '' : 's'}`;
+    if (this.counts.resumes) text += ` · ${this.counts.resumes} resumed`;
+    this.status.setText(text);
   }
 
   // ---- layout ----
 
   resize() {
-    if (!this.stage || !this.canvas) return;
+    if (!this.stage || !this.overlay) return;
     const r = this.stage.getBoundingClientRect();
     this.cssW = r.width;
     this.cssH = r.height;
     this.dpr = Math.min(window.devicePixelRatio || 1, 3);
-    this.canvas.width = Math.max(1, Math.round(r.width * this.dpr));
-    this.canvas.height = Math.max(1, Math.round(r.height * this.dpr));
+    for (const c of [this.base, this.overlay]) {
+      c.width = Math.max(1, Math.round(r.width * this.dpr));
+      c.height = Math.max(1, Math.round(r.height * this.dpr));
+    }
     if (!this.viewReady && r.width > 0) this.resetView();
-    this.schedule();
+    this.scheduleBase();
+    this.scheduleLive();
   }
 
   resetView() {
@@ -614,8 +650,12 @@ class NotebookView extends TextFileView {
   }
 
   toPage(e) {
-    const r = this.canvas.getBoundingClientRect();
+    const r = this.overlay.getBoundingClientRect();
     return this.vp.toPage(e.clientX - r.left, e.clientY - r.top);
+  }
+
+  setViewTransform(ctx) {
+    ctx.setTransform(this.dpr * this.vp.scale, 0, 0, this.dpr * this.vp.scale, this.dpr * this.vp.tx, this.dpr * this.vp.ty);
   }
 
   // ---- commands ----
@@ -624,7 +664,7 @@ class NotebookView extends TextFileView {
     if (this.loadError) return;
     if (this.hist.undo()) {
       this.refresh();
-      this.schedule();
+      this.scheduleBase();
       this.requestSave();
     }
   }
@@ -633,7 +673,7 @@ class NotebookView extends TextFileView {
     if (this.loadError || !this.hist.present.length) return;
     this.hist.commit(this.hist.present, []);
     this.refresh();
-    this.schedule();
+    this.scheduleBase();
     this.requestSave();
   }
 
@@ -646,28 +686,36 @@ class NotebookView extends TextFileView {
     if (decision === 'draw') {
       if (e.pointerType === 'mouse' && e.button !== 0) return;
       if (e.pointerType === 'pen') this.touches.clear(); // a pen cancels any finger scroll
-      this.canvas.setPointerCapture(e.pointerId);
-      if (this.live) this.finishLive(); // never discard a stroke that is still open
-      this.live = makeStroke(INK, STROKE_BASE, []);
-      this.live.owner = e.pointerId; // bookkeeping only; not saved
-      const pt = this.toPage(e);
-      addRawPoint(this.live, pt.x, pt.y, e.pressure, e.timeStamp);
-      this.drawPiece(this.live, 0);
+      this.overlay.setPointerCapture(e.pointerId);
+      if (this.liveStroke) this.finishLive(); // never discard a stroke that is still open
+      this.penId = e.pointerId;
+      this.liveStroke = makeStroke(INK, STROKE_BASE, []);
+      this.appendSamples([e]);
+      this.scheduleLive();
     } else if (decision === 'pan') {
-      this.canvas.setPointerCapture(e.pointerId);
+      this.overlay.setPointerCapture(e.pointerId);
       this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
     }
   }
 
   onPointerMove(e) {
-    if (this.live && e.pointerId === this.live.owner) {
-      const list = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
-      for (const ev of list.length ? list : [e]) {
-        const pt = this.toPage(ev);
-        const idx = this.live.pts.length;
-        addRawPoint(this.live, pt.x, pt.y, ev.pressure, ev.timeStamp);
-        this.drawPiece(this.live, idx);
+    if (e.pointerId === this.penId) {
+      // Pen still on the glass? If not, the pointerup was lost: finish the stroke.
+      if (!(e.buttons & 1)) {
+        this.finishLive();
+        this.endPen();
+        return;
       }
+      if (!this.liveStroke) {
+        // The stroke was interrupted (cancel). Continue it from the last sample, so nothing is lost.
+        this.liveStroke = makeStroke(INK, STROKE_BASE, []);
+        if (this.penLast) this.liveStroke.pts.push(this.penLast);
+        this.counts.resumes++;
+        logEvent('resume', 'stroke continued after an interruption');
+      }
+      const list = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+      this.appendSamples(list.length ? list : [e]);
+      this.scheduleLive();
       return;
     }
     if (this.touches.has(e.pointerId)) {
@@ -675,91 +723,146 @@ class NotebookView extends TextFileView {
       this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (this.touches.size === 1) {
         this.vp.panBy(e.clientX - prev.x, e.clientY - prev.y);
-        this.schedule();
+        this.scheduleBase();
+        this.scheduleLive();
       }
     }
   }
 
   onPointerUp(e) {
     this.router.up(e.pointerId, e.pointerType, e.timeStamp);
-    if (this.live && e.pointerId === this.live.owner) {
+    if (e.pointerId === this.penId) {
       this.finishLive();
+      this.endPen();
     } else if (this.touches.has(e.pointerId)) {
       this.touches.delete(e.pointerId);
     }
   }
 
-  finishLive() {
-    const s = this.live;
-    this.live = null;
-    if (!s || s.pts.length === 0) return;
-    this.hist.commit(this.hist.present, [...this.hist.present, s]);
+  /** The system took the pen away mid-stroke. Keep what was drawn; the next movement continues it. */
+  onPointerCancel(e) {
+    this.counts.cancels++;
+    logEvent('cancel', `${e.pointerType} during stroke: ${this.liveStroke ? 'yes' : 'no'}`);
+    if (e.pointerId === this.penId) this.finishLive();
+    else this.touches.delete(e.pointerId);
     this.refresh();
-    this.requestSave();
+  }
+
+  /** Capture lost while the pen is still down: take it back, so the stroke keeps receiving input. */
+  onLostCapture(e) {
+    this.counts.lostCaptures++;
+    logEvent('lostcapture', `${e.pointerType}, pen still down: ${e.pointerId === this.penId}`);
+    if (e.pointerId === this.penId) {
+      try {
+        this.overlay.setPointerCapture(e.pointerId);
+      } catch (err) {
+        // The pointer is already gone. The next pointerup or move will settle the state.
+      }
+    }
+  }
+
+  endPen() {
+    this.penId = null;
+    this.penLast = null;
+  }
+
+  appendSamples(events) {
+    for (const ev of events) {
+      const pt = this.toPage(ev);
+      const sample = addRawPoint(this.liveStroke, pt.x, pt.y, ev.pressure, ev.timeStamp);
+      this.penLast = sample;
+    }
+  }
+
+  finishLive() {
+    const s = this.liveStroke;
+    this.liveStroke = null;
+    if (s && s.pts.length) {
+      this.hist.commit(this.hist.present, [...this.hist.present, s]);
+      // Draw the finished stroke onto the base with the same routine the overlay used,
+      // so the saved stroke looks exactly like the one that was being written.
+      this.setViewTransform(this.baseCtx);
+      this.drawStroke(this.baseCtx, s, this.pathFor(s, false));
+      this.refresh();
+      this.requestSave();
+    }
+    this.scheduleLive();
   }
 
   onWheel(e) {
     e.preventDefault();
-    const r = this.canvas.getBoundingClientRect();
+    const r = this.overlay.getBoundingClientRect();
     if (e.ctrlKey || e.metaKey) this.vp.zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.01));
     else this.vp.panBy(-e.deltaX, -e.deltaY);
-    this.schedule();
+    this.scheduleBase();
+    this.scheduleLive();
   }
 
   // ---- rendering ----
 
-  /** Draws just the newest sample and its join onto the canvas, right away, with no frame delay. */
-  drawPiece(stroke, idx) {
-    const ctx = this.ctx;
-    const vp = this.vp;
-    ctx.setTransform(this.dpr * vp.scale, 0, 0, this.dpr * vp.scale, this.dpr * vp.tx, this.dpr * vp.ty);
-    ctx.fillStyle = stroke.color;
-    const polys = [dotPoly(stroke.pts[idx], stroke.size)];
-    if (idx > 0) {
-      const s = segmentPoly(stroke.pts[idx - 1], stroke.pts[idx], stroke.size);
-      if (s) polys.push(s);
-    }
-    ctx.fill(polysToPath(polys));
-  }
-
-  /** Full repaint from the stored raw strokes. Used after scrolling, zooming, undo, and resize. */
-  schedule() {
-    if (this.raf || !this.canvas) return;
-    this.raf = requestAnimationFrame(() => {
-      this.raf = 0;
-      this.paint();
+  scheduleBase() {
+    if (this.baseRaf || !this.base) return;
+    this.baseRaf = requestAnimationFrame(() => {
+      this.baseRaf = 0;
+      this.paintBase();
     });
   }
 
-  pathOf(stroke) {
-    let p = this.pathCache.get(stroke);
+  scheduleLive() {
+    if (this.liveRaf || !this.overlay) return;
+    this.liveRaf = requestAnimationFrame(() => {
+      this.liveRaf = 0;
+      this.paintLive();
+    });
+  }
+
+  /** The shape used for a stroke. Cached for committed strokes, rebuilt each frame for the live one. */
+  pathFor(stroke, live) {
+    const pressure = this.plugin.settings.pressureWidth;
+    if (live) return pressure ? polysToPath(strokePolys(stroke)) : linePath(stroke);
+    const cache = pressure ? this.polyCache : this.lineCache;
+    let p = cache.get(stroke);
     if (!p) {
-      p = polysToPath(strokePolys(stroke));
-      this.pathCache.set(stroke, p);
+      p = pressure ? polysToPath(strokePolys(stroke)) : linePath(stroke);
+      cache.set(stroke, p);
     }
     return p;
   }
 
-  paint() {
-    const ctx = this.ctx;
+  drawStroke(ctx, stroke, path) {
+    ctx.fillStyle = stroke.color;
+    ctx.strokeStyle = stroke.color;
+    if (this.plugin.settings.pressureWidth) {
+      ctx.fill(path);
+    } else {
+      ctx.lineWidth = stroke.size;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.stroke(path);
+    }
+  }
+
+  paintBase() {
+    const ctx = this.baseCtx;
     if (!ctx) return;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = document.body.classList.contains('theme-dark') ? '#1e1e1e' : '#e7e5df';
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-
-    const vp = this.vp;
-    const dpr = this.dpr;
-    ctx.setTransform(dpr * vp.scale, 0, 0, dpr * vp.scale, dpr * vp.tx, dpr * vp.ty);
+    ctx.fillRect(0, 0, this.base.width, this.base.height);
+    this.setViewTransform(ctx);
     ctx.fillStyle = PAPER;
     ctx.fillRect(0, 0, PAGE_W, PAGE_H);
-    for (const s of this.hist.present) {
-      ctx.fillStyle = s.color;
-      ctx.fill(this.pathOf(s));
-    }
-    if (this.live) {
-      ctx.fillStyle = this.live.color;
-      ctx.fill(polysToPath(strokePolys(this.live)));
-    }
+    for (const s of this.hist.present) this.drawStroke(ctx, s, this.pathFor(s, false));
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+
+  paintLive() {
+    const ctx = this.overlayCtx;
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, this.overlay.width, this.overlay.height);
+    if (!this.liveStroke) return;
+    this.setViewTransform(ctx);
+    this.drawStroke(ctx, this.liveStroke, this.pathFor(this.liveStroke, true));
     ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
 }
@@ -849,6 +952,27 @@ const SELF_TESTS = [
         const w = widthFor(2, p);
         assert(Number.isFinite(w) && w > 0, `width for ${p} is ${w}`);
       }
+    },
+  },
+
+  {
+    name: 'Line: a stroke is drawn through its raw samples, in order, with nothing added',
+    run() {
+      const s = makeStroke(INK, 2, []);
+      const xs = [5, 20, 35, 50];
+      xs.forEach((x, i) => addRawPoint(s, x, 10 + i, 0.5, i));
+      const line = linePoints(s);
+      assert(line.length === 4, `expected 4 points, got ${line.length}`);
+      line.forEach((q, i) => assert(q.x === xs[i] && q.y === 10 + i, `point ${i} moved`));
+    },
+  },
+  {
+    name: 'Line: a single sample still produces a visible dot',
+    run() {
+      const s = makeStroke(INK, 2, []);
+      addRawPoint(s, 40, 40, 0.5, 0);
+      const line = linePoints(s);
+      assert(line.length === 2 && line[1].x !== line[0].x, 'single sample has no length');
     },
   },
 
@@ -1046,12 +1170,12 @@ const SELF_TESTS = [
   {
     name: 'Updates: a downloaded main.js must match its version and compile',
     run() {
-      verifyMainJs("const BUILD_VERSION = '0.2.0';\nmodule.exports = {};", '0.2.0');
+      verifyMainJs("const BUILD_VERSION = '0.9.9';\nmodule.exports = {};", '0.9.9');
       let rejected = 0;
       for (const [js, v] of [
-        ["const BUILD_VERSION = '0.2.0';", '0.3.0'],
-        ['module.exports = {};', '0.2.0'],
-        ["const BUILD_VERSION = '0.2.0'; function (", '0.2.0'],
+        ["const BUILD_VERSION = '0.2.1';", '0.3.0'],
+        ['module.exports = {};', '0.9.9'],
+        ["const BUILD_VERSION = '0.2.1'; function (", '0.9.9'],
       ]) {
         try {
           verifyMainJs(js, v);
@@ -1292,6 +1416,16 @@ class TwoAlmSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName('Pressure changes thickness')
+      .setDesc('Off: every stroke is one even line, which keeps straight strokes straight. On: pressing harder makes the line thicker. Applies when you open a notebook.')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.pressureWidth).onChange(async (v) => {
+          this.plugin.settings.pressureWidth = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
       .setName('Self-tests')
       .setDesc('Checks the drawing and file logic on this device.')
       .addButton((b) => b.setButtonText('Run').onClick(() => this.plugin.showSelfTests()));
@@ -1308,6 +1442,7 @@ TwoAlmPlugin.__internals = {
   makeStroke,
   addRawPoint,
   strokePolys,
+  linePoints,
   segmentPoly,
   dotPoly,
   signedArea,
